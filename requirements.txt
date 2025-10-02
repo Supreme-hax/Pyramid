@@ -1,0 +1,6 @@
+streamlit>=1.31.0
+pandas>=2.0.0
+plotly>=5.18.0
+stripe>=7.0.0
+networkx>=3.2
+matplotlib>=3.8.0
