@@ -1,113 +1,399 @@
 import streamlit as st
-from auth import owner_login
-from config import load_config, save_config
-from payment import start_checkout, verify_and_record
-from referral import register_member, distribute_payouts
-from ui import (
-    kpi_cards,
-    inflow_outflow_chart,
-    level_bar_chart,
-    tree_view,
-    members_table,
-)
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
+from datetime import datetime
+import hashlib, os, json
 
-# ------------------------
-# Page config & style
-# ------------------------
-st.set_page_config(page_title="এডভান্স পিরামিড স্কিম", layout="wide")
-st.markdown(
+BASE_DIR = Path(__file__).parent
+DB_PATH = BASE_DIR / "pyramid_app.db"
+
+# --------------------- Database helpers ---------------------
+@contextmanager
+def get_db():
+    con = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+    finally:
+        con.close()
+
+def init_db():
+    schema = """
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        email TEXT,
+        password_hash TEXT,
+        salt TEXT,
+        balance REAL DEFAULT 0,
+        parent_id INTEGER,
+        joined_at TEXT,
+        level INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        member_id INTEGER,
+        type TEXT, -- deposit, withdrawal, commission, adjustment
+        method TEXT, -- nagad, bkash, rocket, admin
+        amount REAL,
+        status TEXT, -- pending, approved, rejected
+        note TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
     """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Bengali:wght@400;600;700&display=swap');
-html,body,[class*="css"]{font-family:'Noto Sans Bengali',sans-serif;}
-:root{--primary:#FFD700;--secondary:#1E90FF;--bg:#F7F9FC;--card:#FFFFFF;--text:#0F172A;}
-body{background-color:var(--bg);} .card{background:var(--card);border-radius:16px;padding:16px;box-shadow:0 8px 24px rgba(16,24,40,.06);border:1px solid #EEF2F7;}
-h1,h2,h3,h4{color:var(--text);} .badge{display:inline-block;padding:6px 10px;border-radius:999px;font-size:.9rem;font-weight:600;background:#FFF1B8;color:#7C5800;border:1px solid #FFE58F;}
-.warn{background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;}
-.ok{background:#ECFDF5;color:#065F46;border:1px solid #A7F3D0;}
-.kpi{border-radius:14px;padding:16px;background:linear-gradient(180deg,#FFF,#FFFDF3);border:1px solid #F1F5F9;}
-.kpi h3{margin:0 0 6px 0;font-weight:700;}
-.kpi .val{font-size:1.6rem;font-weight:700;color:#0F172A;}
-footer{visibility:hidden;}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+    with get_db() as con:
+        con.executescript(schema)
+        con.commit()
 
-st.title("🔺 এডভান্স পিরামিড স্কিম")
-st.markdown("<p class='badge warn'>শিক্ষামূলক ডেমো – বাস্তব অর্থ লেনদেনের জন্য সম্পূর্ণ কনফিগারেশন দরকার।</p>", unsafe_allow_html=True)
+def get_config(key, default=None):
+    with get_db() as con:
+        cur = con.execute("SELECT value FROM config WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row:
+            return json.loads(row["value"])
+        return default
 
-# ---------- Owner login ----------
-if not owner_login():
-    st.info("⚙️ Owner‑only controls are hidden. Log in from the sidebar to manage the scheme.")
-else:
-    st.success("✅ Logged in as owner")
+def set_config(key, value):
+    with get_db() as con:
+        con.execute("REPLACE INTO config (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+        con.commit()
 
-# ---------- Config (owner‑only) ----------
-cfg = load_config()
-if st.session_state.get("owner"):
-    with st.sidebar.expander("⚙️ Owner Settings", expanded=False):
-        max_levels = st.slider("মোট লেভেল", 2, 12, cfg["max_levels"])
-        branching = st.slider("ব্রাঞ্চিং (প্রতি সদস্য কতজনকে রেফার করতে পারে)", 1, 5, cfg["branching"])
-        entry_fee = st.number_input("এন্ট্রি ফি (৳)", min_value=100, value=cfg["entry_fee"], step=100)
-        payout_ratio = st.slider("পেআউট অনুপাত (%)", 0, 100, cfg["payout_ratio"])
-        market_cap = st.slider("মার্কেট ক্যাপ (সর্বোচ্চ সদস্য)", 1000, 500000, cfg["market_cap_limit"])
-        if st.button("💾 Save Settings"):
-            new_cfg = {
-                "max_levels": max_levels,
-                "branching": branching,
-                "entry_fee": entry_fee,
-                "payout_ratio": payout_ratio,
-                "market_cap_limit": market_cap,
-                "payout_depth": cfg.get("payout_depth", 3),
-            }
-            save_config(new_cfg)
-            st.success("✅ Settings saved")
-            st.rerun()
+# --------------------- Security ---------------------
+def make_salt():
+    return os.urandom(16).hex()
 
-# ---------- Public registration ----------
-st.subheader("🚀 Join the Referral Program")
-name = st.text_input("Your name")
-ref_code = st.text_input("Referral code (optional)")
-if st.button("Join"):
-    if not name:
-        st.error("Please enter your name.")
+def hash_password(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+
+# --------------------- User Management ---------------------
+def register_user(username, password, email=None, parent_username=None):
+    salt = make_salt()
+    ph = hash_password(password, salt)
+    parent_id = None
+    level = 0
+    if parent_username:
+        with get_db() as con:
+            cur = con.execute("SELECT id, level FROM users WHERE username = ?", (parent_username,))
+            parent = cur.fetchone()
+            if parent:
+                parent_id = parent["id"]
+                level = parent["level"] + 1
+    joined = datetime.utcnow().isoformat()
+    with get_db() as con:
+        con.execute("INSERT INTO users (username, email, password_hash, salt, parent_id, joined_at, level) VALUES (?,?,?,?,?,?,?)",
+                    (username, email, ph, salt, parent_id, joined, level))
+        con.commit()
+    return True
+
+def authenticate(username, password):
+    with get_db() as con:
+        cur = con.execute("SELECT id, password_hash, salt FROM users WHERE username = ?", (username,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        ph = hash_password(password, row["salt"])
+        if ph == row["password_hash"]:
+            return row["id"]
+    return None
+
+def get_user(user_id):
+    with get_db() as con:
+        cur = con.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        return cur.fetchone()
+
+def get_user_by_username(username):
+    with get_db() as con:
+        cur = con.execute("SELECT * FROM users WHERE username = ?", (username,))
+        return cur.fetchone()
+
+# --------------------- Transactions ---------------------
+def create_transaction(member_id, type_, amount, method="manual", status="pending", note=None):
+    now = datetime.utcnow().isoformat()
+    with get_db() as con:
+        con.execute("INSERT INTO transactions (member_id, type, method, amount, status, note, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (member_id, type_, method, amount, status, note, now))
+        con.commit()
+        return con.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+
+def list_transactions(member_id=None, status=None, type_=None, limit=100):
+    q = "SELECT * FROM transactions WHERE 1=1"
+    params = []
+    if member_id:
+        q += " AND member_id = ?"
+        params.append(member_id)
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+    if type_:
+        q += " AND type = ?"
+        params.append(type_)
+    q += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with get_db() as con:
+        cur = con.execute(q, tuple(params))
+        return cur.fetchall()
+
+def change_transaction_status(tx_id, new_status, admin_note=None):
+    with get_db() as con:
+        con.execute("UPDATE transactions SET status = ?, note = COALESCE(note, '') || ? WHERE id = ?", (new_status, f" | {admin_note}" if admin_note else "", tx_id))
+        con.commit()
+        cur = con.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,))
+        tx = cur.fetchone()
+    # If approved and deposit -> credit user and distribute commissions
+    if tx and new_status == "approved":
+        if tx["type"] == "deposit":
+            credit_user(tx["member_id"], tx["amount"])
+            distribute_commissions(tx["member_id"], tx["amount"], tx["id"])
+        elif tx["type"] == "withdrawal":
+            # already deducted on admin approve or at request time depending on policy
+            pass
+    return tx
+
+def credit_user(user_id, amount):
+    with get_db() as con:
+        con.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
+        con.commit()
+
+def debit_user(user_id, amount):
+    with get_db() as con:
+        con.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, user_id))
+        con.commit()
+
+# --------------------- Referral + Commission ---------------------
+def get_parent_chain(user_id, max_levels=5):
+    chain = []
+    current = user_id
+    with get_db() as con:
+        for i in range(max_levels):
+            cur = con.execute("SELECT parent_id FROM users WHERE id = ?", (current,))
+            row = cur.fetchone()
+            if not row or not row["parent_id"]:
+                break
+            pid = row["parent_id"]
+            chain.append(pid)
+            current = pid
+    return chain  # [parent_level1, parent_level2, ...]
+
+def distribute_commissions(member_id, amount, source_tx_id=None):
+    # Commission structure (levels 1..n)
+    commission_rates = get_config("commission_rates", [0.10, 0.05, 0.02])
+    parents = get_parent_chain(member_id, max_levels=len(commission_rates))
+    for idx, parent_id in enumerate(parents):
+        rate = commission_rates[idx] if idx < len(commission_rates) else 0
+        if rate <= 0:
+            continue
+        comm_amount = round(amount * rate, 2)
+        if comm_amount <= 0:
+            continue
+        # credit parent account
+        credit_user(parent_id, comm_amount)
+        # record transaction
+        note = f"Commission level {idx+1} from member {member_id} (source tx {source_tx_id})"
+        create_transaction(parent_id, "commission", comm_amount, method="system", status="approved", note=note)
+
+# --------------------- Utilities / Admin ---------------------
+def ensure_sample_data():
+    # create an owner if not exists for demonstration (owner is controlled by Streamlit secrets)
+    owner_name = None
+    try:
+        owner_name = st.secrets["owner"]["name"]
+    except Exception:
+        pass
+    if owner_name and not get_user_by_username(owner_name):
+        # create a user record for owner (no password)
+        salt = make_salt()
+        ph = hash_password("owner_password", salt)
+        with get_db() as con:
+            con.execute("INSERT OR IGNORE INTO users (username, email, password_hash, salt, joined_at, level) VALUES (?,?,?,?,?,?)",
+                        (owner_name, None, ph, salt, datetime.utcnow().isoformat(), 0))
+            con.commit()
+
+def list_users(limit=200):
+    with get_db() as con:
+        cur = con.execute("SELECT * FROM users ORDER BY id DESC LIMIT ?", (limit,))
+        return cur.fetchall()
+
+def user_referrals(user_id):
+    with get_db() as con:
+        cur = con.execute("SELECT * FROM users WHERE parent_id = ? ORDER BY joined_at DESC", (user_id,))
+        return cur.fetchall()
+
+# --------------------- Streamlit UI ---------------------
+def sidebar_auth():
+    st.sidebar.title("Authentication")
+    if st.session_state.get("user_id"):
+        u = get_user(st.session_state["user_id"])
+        st.sidebar.markdown(f"**Logged in as:** {u['username']}  \nBalance: ৳{u['balance']:,}")
+        if st.sidebar.button("Logout"):
+            del st.session_state["user_id"]
+            st.experimental_rerun()
     else:
-        try:
-            member_id, fee, parent_id, level = register_member(ref_code or None)
-            checkout_url = start_checkout(entry_fee=fee, member_id=member_id)
-            st.markdown(f"[Proceed to payment]({checkout_url})", unsafe_allow_html=True)
-            st.info(f"Your member ID: **{member_id}** | Level: {level}")
-        except Exception as e:
-            st.error(f"Registration failed: {str(e)}")
-
-# ---------- After payment callback ----------
-query_params = st.query_params
-if "session_id" in query_params and "member" in query_params:
-    sess_id = query_params["session_id"]
-    mem_id = query_params["member"]
-    
-    # Validate member ID format
-    if mem_id and (mem_id.startswith("N") or mem_id == "A-ROOT"):
-        try:
-            if verify_and_record(sess_id, mem_id):
-                distribute_payouts(mem_id)
-                st.success("✅ Payment confirmed! You have been added to the pyramid.")
-                # Clear query params
-                st.query_params.clear()
-                st.rerun()
+        tab = st.sidebar.radio("Choose", ["Login","Register"])
+        if tab == "Login":
+            username = st.sidebar.text_input("Username", key="login_user")
+            password = st.sidebar.text_input("Password", type="password", key="login_pass")
+            if st.sidebar.button("Login", key="login_btn"):
+                uid = authenticate(username, password)
+                if uid:
+                    st.session_state["user_id"] = uid
+                    st.sidebar.success("Logged in")
+                    st.experimental_rerun()
+                else:
+                    st.sidebar.error("Invalid credentials")
+        else:
+            new_user = st.sidebar.text_input("Choose username", key="reg_user")
+            new_pass = st.sidebar.text_input("Choose password", type="password", key="reg_pass")
+            ref = st.sidebar.text_input("Referral (username)", key="reg_ref")
+            if st.sidebar.button("Register", key="reg_btn"):
+                if not new_user or not new_pass:
+                    st.sidebar.error("Username and password required")
+                elif get_user_by_username(new_user):
+                    st.sidebar.error("Username already exists")
+                else:
+                    register_user(new_user, new_pass, parent_username=ref or None)
+                    st.sidebar.success("Registration complete. Please login.")
+# Main views
+def user_dashboard(user_id):
+    st.header("Multi-user Dashboard")
+    u = get_user(user_id)
+    st.subheader(f"Welcome, {u['username']}")
+    st.metric("Balance (৳)", f"{u['balance']:,}")
+    st.write("Joined:", u["joined_at"])
+    # Quick actions
+    st.markdown("### Actions")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### Deposit (manual)")
+        dep_amt = st.number_input("Amount (৳)", min_value=10.0, step=10.0, key="dep_amt")
+        dep_method = st.selectbox("Method", ["nagad","bkash","rocket"], key="dep_method")
+        dep_note = st.text_input("Note / txn id (optional)", key="dep_note")
+        if st.button("Request Deposit", key="req_dep"):
+            txid = create_transaction(user_id, "deposit", dep_amt, method=dep_method, status="pending", note=dep_note)
+            st.success(f"Deposit requested (tx id {txid}). Admin will approve.")
+    with col2:
+        st.markdown("#### Withdraw (manual)")
+        w_amt = st.number_input("Amount (৳)", min_value=50.0, step=50.0, key="w_amt")
+        w_method = st.selectbox("Method", ["nagad","bkash","rocket"], key="w_method")
+        w_note = st.text_input("Withdraw note / mobile", key="w_note")
+        if st.button("Request Withdraw", key="req_w"):
+            # check balance
+            if u["balance"] is None or u["balance"] < w_amt:
+                st.error("Insufficient balance")
             else:
-                st.error("❌ Payment verification failed.")
-        except Exception as e:
-            st.error(f"❌ Error processing payment: {str(e)}")
+                # create withdrawal as pending; optionally debit immediately or on approval
+                create_transaction(user_id, "withdrawal", w_amt, method=w_method, status="pending", note=w_note)
+                st.success("Withdrawal requested. Admin will process it.")
+    st.markdown("### Transactions")
+    txs = list_transactions(member_id=user_id, limit=200)
+    if txs:
+        for t in txs:
+            st.write(dict(t))
     else:
-        st.error("❌ Invalid member ID format.")
+        st.info("No transactions yet.")
+    st.markdown("### Referrals")
+    refs = user_referrals(user_id)
+    st.write(f"Direct referrals ({len(refs)}):")
+    for r in refs:
+        st.write(dict(r))
 
-# ---------- Dashboard ----------
-st.divider()
-kpi_cards()
-inflow_outflow_chart()
-level_bar_chart()
-tree_view()
-st.divider()
-members_table()
+def admin_panel():
+    st.header("Admin Panel")
+    # Owner check
+    try:
+        owner_name = st.secrets["owner"]["name"]
+    except Exception:
+        owner_name = None
+    st.write("Owner:", owner_name or "(not set in secrets)")
+    # Quick stats
+    with get_db() as con:
+        total_users = con.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+        total_deposits = con.execute("SELECT SUM(amount) as s FROM transactions WHERE type='deposit' AND status='approved'").fetchone()["s"] or 0.0
+        total_withdraw = con.execute("SELECT SUM(amount) as s FROM transactions WHERE type='withdrawal' AND status='approved'").fetchone()["s"] or 0.0
+    st.metric("Total users", total_users)
+    st.metric("Total approved deposits (৳)", f"{total_deposits:,}")
+    st.metric("Total approved withdrawals (৳)", f"{total_withdraw:,}")
+
+    st.markdown("### Pending Transactions")
+    pend = list_transactions(status="pending", limit=500)
+    for t in pend:
+        cols = st.columns([1,1,2,1,1,2])
+        cols[0].write(t["id"])
+        cols[1].write(t["member_id"])
+        cols[2].write(t["type"])
+        cols[3].write(f"৳{t['amount']}")
+        cols[4].write(t["method"])
+        if cols[5].button("Approve", key=f"app_{t['id']}"):
+            # Approve: credit or debit accordingly
+            if t["type"] == "deposit":
+                change_transaction_status(t["id"], "approved", admin_note=f"Approved by admin")
+                st.experimental_rerun()
+            elif t["type"] == "withdrawal":
+                # ensure user has balance
+                user = get_user(t["member_id"])
+                if user["balance"] >= t["amount"]:
+                    # debit and mark approved
+                    debit_user(user["id"], t["amount"])
+                    change_transaction_status(t["id"], "approved", admin_note=f"Approved by admin")
+                    st.experimental_rerun()
+                else:
+                    st.error("Insufficient balance to approve withdrawal")
+        if cols[5].button("Reject", key=f"rej_{t['id']}"):
+            change_transaction_status(t["id"], "rejected", admin_note="Rejected by admin")
+            st.experimental_rerun()
+
+    st.markdown("### Users")
+    users = list_users(500)
+    for u in users:
+        st.write(dict(u))
+
+# --------------------- App Initialization ---------------------
+if not DB_PATH.exists():
+    init_db()
+    # set default commission config if not set
+    set_config("commission_rates", [0.10, 0.05, 0.02])
+
+ensure_sample_data()
+
+# --------------------- Page routing ---------------------
+st.set_page_config(page_title="Pyramid App", layout="wide")
+st.title("Pyramid / Referral App (Streamlit)")
+
+# Owner login (sidebar)
+from auth import owner_login
+is_owner = owner_login()
+
+sidebar_auth()
+
+if is_owner:
+    st.sidebar.success("Owner mode active")
+    view = st.sidebar.selectbox("Admin Views", ["Dashboard","Admin Panel","Config"])
+    if view == "Admin Panel":
+        admin_panel()
+    elif view == "Config":
+        st.header("Config")
+        comm = get_config("commission_rates", [0.10,0.05,0.02])
+        st.write("Commission rates (level1, level2, ...):", comm)
+        new = st.text_input("New comma-separated rates (e.g. 0.1,0.05,0.02)", key="cfg_rates")
+        if st.button("Save config"):
+            try:
+                rates = [float(x.strip()) for x in new.split(",") if x.strip()]
+                set_config("commission_rates", rates)
+                st.success("Saved")
+            except Exception as e:
+                st.error("Invalid input")
+    else:
+        st.header("Owner Dashboard")
+        admin_panel()
+else:
+    # normal user view
+    if st.session_state.get("user_id"):
+        user_dashboard(st.session_state["user_id"])
+    else:
+        st.info("Please login or register from the sidebar to use the app.")
