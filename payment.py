@@ -1,4 +1,6 @@
-# pyramid_app/payment.py
+# ============================================================================
+# payment.py - FIXED IMPORTS
+# ============================================================================
 """
 Payment & transaction logic:
 - create_transaction(member_id, type_, amount, method, note)
@@ -8,9 +10,9 @@ Payment & transaction logic:
 - credit_user / debit_user low-level helpers
 """
 
-from .db import get_db, get_config, set_config
+from db import get_db, get_config, set_config  # CHANGED: removed relative import
 from datetime import datetime
-from .referral import get_parent_chain
+from referral import get_parent_chain  # CHANGED: removed relative import
 import json
 
 def create_transaction(member_id:int, type_:str, amount:float, method:str="manual", note:str=None, source_tx_id=None):
