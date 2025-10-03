@@ -1,150 +1,50 @@
-import random
-import string
-from datetime import datetime
-from db import get_db
-from config import load_config
+# pyramid_app/referral.py
+"""
+Referral utilities:
+- register_referral chain queries
+- get_direct_referrals(user_id)
+- get_parent_chain(user_id, max_levels)
+- referral_tree(user_id, depth) -> nested dict for visualization
+"""
 
-def _generate_member_id():
-    """Generate a unique member ID."""
-    timestamp = int(datetime.utcnow().timestamp())
-    random_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
-    return f"N{timestamp}-{random_suffix}"
+from .db import get_db, get_config
+from typing import List, Dict
 
-def register_member(ref_code: str | None = None):
-    """Register a new member and return (member_id, fee, parent_id, level)."""
-    cfg = load_config()
-    entry_fee = cfg["entry_fee"]
-    max_levels = cfg["max_levels"]
-    branching = cfg["branching"]
-    market_cap = cfg["market_cap_limit"]
-
-    # Capacity check
+def get_direct_referrals(user_id: int):
     with get_db() as con:
-        total = con.execute("SELECT COUNT(*) FROM members").fetchone()[0]
-        if total >= market_cap:
-            raise RuntimeError("Market cap reached – no more registrations allowed.")
+        rows = con.execute("SELECT id, username, level, created_at FROM users WHERE parent_id = ? ORDER BY created_at DESC", (user_id,)).fetchall()
+        return rows
 
-        # Decide parent / level
-        parent_id = None
-        level = 1
-        
-        if ref_code:
-            # Validate referral code
-            parent = con.execute(
-                "SELECT id, level FROM members WHERE id = ?", 
-                (ref_code,)
-            ).fetchone()
-            
-            if parent:
-                parent_id = ref_code
-                level = parent["level"] + 1
-                
-                # Check if parent has reached branching limit
-                child_count = con.execute(
-                    "SELECT COUNT(*) FROM members WHERE parent = ?",
-                    (parent_id,)
-                ).fetchone()[0]
-                
-                if child_count >= branching:
-                    raise RuntimeError(f"Referral code {ref_code} has reached maximum referrals.")
-                
-                if level > max_levels:
-                    raise RuntimeError(f"Maximum level ({max_levels}) reached.")
-            else:
-                raise RuntimeError(f"Invalid referral code: {ref_code}")
-        else:
-            # Auto-assign to a parent with available slots
-            if total > 0:
-                available_parents = con.execute(
-                    """
-                    SELECT m.id, m.level, COUNT(c.id) as child_count
-                    FROM members m
-                    LEFT JOIN members c ON c.parent = m.id
-                    WHERE m.level < ?
-                    GROUP BY m.id, m.level
-                    HAVING child_count < ?
-                    ORDER BY m.level, m.joined_at
-                    LIMIT 1
-                    """,
-                    (max_levels, branching)
-                ).fetchone()
-                
-                if available_parents:
-                    parent_id = available_parents["id"]
-                    level = available_parents["level"] + 1
+def get_parent_chain(user_id:int, max_levels:int=None) -> List[int]:
+    if max_levels is None:
+        max_levels = get_config("max_levels", 10)
+    chain = []
+    cur_id = user_id
+    with get_db() as con:
+        for i in range(max_levels):
+            r = con.execute("SELECT parent_id FROM users WHERE id = ?", (cur_id,)).fetchone()
+            if not r or not r["parent_id"]:
+                break
+            pid = r["parent_id"]
+            chain.append(pid)
+            cur_id = pid
+    return chain
 
-        # Generate unique member ID
-        member_id = _generate_member_id()
-        
-        # Insert new member
-        con.execute(
-            "INSERT INTO members (id, level, parent, joined_at, paid, payout) "
-            "VALUES (?,?,?,?,0,0)",
-            (member_id, level, parent_id, int(datetime.utcnow().timestamp())),
-        )
-        con.commit()
-    
-    return member_id, entry_fee, parent_id, level
-
-def distribute_payouts(new_member_id: str):
-    """Distribute payouts to upline members."""
-    cfg = load_config()
-    ratio = cfg["payout_ratio"] / 100.0
-    depth = cfg.get("payout_depth", 3)
-
-    try:
+def referral_tree(user_id:int, depth=3) -> Dict:
+    """Return nested tree: {'id':..., 'username':..., 'children':[...]}"""
+    with get_db() as con:
+        root = con.execute("SELECT id, username FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not root:
+            return {}
+    def build(node_id, current_depth):
         with get_db() as con:
-            # Get inflow amount
-            inflow_row = con.execute(
-                "SELECT amount FROM transactions WHERE member_id = ? AND type='inflow' "
-                "ORDER BY ts DESC LIMIT 1",
-                (new_member_id,),
-            ).fetchone()
-            
-            if not inflow_row:
-                return
-            
-            inflow = inflow_row["amount"]
-            pool = inflow * ratio
-            
-            # Distribution weights: 50%, 30%, 20%
-            weights = [0.5, 0.3, 0.2]
-            
-            # Traverse upline
-            current_id = new_member_id
-            lvl = 0
-            
-            while lvl < depth:
-                parent_row = con.execute(
-                    "SELECT parent FROM members WHERE id = ?", 
-                    (current_id,)
-                ).fetchone()
-                
-                if not parent_row or not parent_row["parent"]:
-                    break
-                
-                parent_id = parent_row["parent"]
-                weight = weights[lvl] if lvl < len(weights) else 0.1
-                share = pool * weight
-                
-                # Update parent payout
-                con.execute(
-                    "UPDATE members SET payout = payout + ? WHERE id = ?",
-                    (share, parent_id),
-                )
-                
-                # Record outflow transaction
-                con.execute(
-                    "INSERT INTO transactions (member_id, type, amount, ts) "
-                    "VALUES (?,?,?,?)",
-                    (parent_id, "outflow", int(share), 
-                     int(datetime.utcnow().timestamp())),
-                )
-                
-                current_id = parent_id
-                lvl += 1
-            
-            con.commit()
-    except Exception as e:
-        print(f"Error distributing payouts: {e}")
-        raise
+            children = con.execute("SELECT id, username FROM users WHERE parent_id = ?", (node_id,)).fetchall()
+        if current_depth >= depth:
+            return {"id": node_id, "children": [{"id": c["id"], "username": c["username"]} for c in children]}
+        return {"id": node_id, "username": get_username(node_id), "children":[build(c["id"], current_depth+1) for c in children]}
+    return build(user_id, 0)
+
+def get_username(user_id):
+    with get_db() as con:
+        r = con.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+        return r["username"] if r else None
