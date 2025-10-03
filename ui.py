@@ -1,11 +1,13 @@
-# pyramid_app/ui.py
+# ============================================================================
+# ui.py - FIXED IMPORTS
+# ============================================================================
 """
 UI helper functions: kpi_cards, transactions_table, referrals_tree_visual (text),
 export_csv, basic charts (matplotlib).
 """
 
 import streamlit as st
-from .db import get_db
+from db import get_db  # CHANGED: removed relative import
 import pandas as pd
 import io
 import matplotlib.pyplot as plt
