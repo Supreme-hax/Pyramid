@@ -1,10 +1,12 @@
-# pyramid_app/config.py
+# ============================================================================
+# config.py - FIXED IMPORTS
+# ============================================================================
 """
 Helper to manage config UI and default settings.
 Wraps db.get_config / set_config with typed defaults.
 """
 
-from .db import get_config, set_config
+from db import get_config, set_config  # CHANGED: removed relative import
 
 def get_commission_rates():
     return get_config("commission_rates", [0.10, 0.05, 0.02])
