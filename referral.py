@@ -1,4 +1,6 @@
-# pyramid_app/referral.py
+# ============================================================================
+# referral.py - FIXED IMPORTS
+# ============================================================================
 """
 Referral utilities:
 - register_referral chain queries
@@ -7,7 +9,7 @@ Referral utilities:
 - referral_tree(user_id, depth) -> nested dict for visualization
 """
 
-from .db import get_db, get_config
+from db import get_db, get_config  # CHANGED: removed relative import
 from typing import List, Dict
 
 def get_direct_referrals(user_id: int):
