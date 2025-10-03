@@ -1,132 +1,151 @@
+# main.py  (Streamlit entrypoint)
 import streamlit as st
-import sqlite3
-from pyramid_app import auth, db, referral, payment
+from pyramid_app import auth, db, payment, referral, ui, config
+from pyramid_app.db import get_db
+import pandas as pd
+import io
 
 st.set_page_config(page_title="Pyramid App", layout="wide")
 
-# ------------------------------
-# Sidebar Authentication
-# ------------------------------
-def sidebar_auth():
-    st.sidebar.title("Authentication")
+# Ensure DB ready
+db.init_db()
 
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
-        st.session_state.username = None
-        st.session_state.role = None
+# Sidebar: Owner login + user auth
+is_owner = auth.owner_login_widget()
 
-    if st.session_state.logged_in:
-        st.sidebar.success(f"Welcome, {st.session_state.username} ({st.session_state.role})")
+def sidebar_user_auth():
+    st.sidebar.title("Account")
+    if st.session_state.get("user_id"):
+        uid = st.session_state["user_id"]
+        with get_db() as con:
+            u = con.execute("SELECT username, balance FROM users WHERE id = ?", (uid,)).fetchone()
+        st.sidebar.markdown(f"**{u['username']}**\n\nBalance: ৳{u['balance']:,}")
         if st.sidebar.button("Logout"):
-            st.session_state.logged_in = False
-            st.session_state.username = None
-            st.session_state.role = None
-            st.session_state.logged_out = True
+            del st.session_state["user_id"]
             st.rerun()
     else:
-        option = st.sidebar.radio("Choose", ["Login", "Register"])
-        if option == "Login":
-            username = st.sidebar.text_input("Username")
-            password = st.sidebar.text_input("Password", type="password")
-            if st.sidebar.button("Login"):
-                user = auth.login_user(username, password)
+        mode = st.sidebar.radio("Action", ["Login","Register"])
+        if mode == "Login":
+            username = st.sidebar.text_input("Username", key="login_user")
+            password = st.sidebar.text_input("Password", type="password", key="login_pass")
+            if st.sidebar.button("Login", key="login_btn"):
+                user = auth.authenticate(username, password)
                 if user:
-                    st.session_state.logged_in = True
-                    st.session_state.username = username
-                    st.session_state.role = user["role"]
-                    st.success("Login successful!")
+                    st.session_state["user_id"] = user["id"]
+                    st.success("Logged in")
                     st.rerun()
                 else:
                     st.error("Invalid credentials")
         else:
-            username = st.sidebar.text_input("Choose Username")
-            password = st.sidebar.text_input("Choose Password", type="password")
-            referrer = st.sidebar.text_input("Referral Username (optional)")
-            if st.sidebar.button("Register"):
-                ok = auth.register_user(username, password, referrer)
-                if ok:
-                    st.success("Registered successfully, you can login now.")
-                else:
-                    st.error("Registration failed (username may already exist).")
+            new_user = st.sidebar.text_input("Choose username", key="reg_user")
+            new_pass = st.sidebar.text_input("Choose password", type="password", key="reg_pass")
+            ref = st.sidebar.text_input("Referral username (optional)", key="reg_ref")
+            if st.sidebar.button("Register", key="reg_btn"):
+                try:
+                    auth.register_user(new_user, new_pass, referrer_username=ref if ref else None)
+                    st.success("Registration successful. Please login.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-# ------------------------------
-# User Dashboard
-# ------------------------------
-def user_dashboard():
-    st.title("User Dashboard")
-    balance = db.get_balance(st.session_state.username)
-    st.metric("Balance", f"{balance} BDT")
+sidebar_user_auth()
 
-    st.subheader("Deposit")
-    amount = st.number_input("Deposit Amount", min_value=100, step=50)
-    method = st.selectbox("Payment Method", ["nagad", "bkash", "rocket"])
-    if st.button("Request Deposit"):
-        payment.request_deposit(st.session_state.username, amount, method)
-        st.success("Deposit request submitted, pending admin approval.")
+st.title("Pyramid / Referral App")
 
-    st.subheader("Withdraw")
-    amount_w = st.number_input("Withdraw Amount", min_value=100, step=50)
-    method_w = st.selectbox("Withdraw Method", ["nagad", "bkash", "rocket"])
-    if st.button("Request Withdraw"):
-        payment.request_withdraw(st.session_state.username, amount_w, method_w)
-        st.success("Withdraw request submitted, pending admin approval.")
-
-    st.subheader("Referrals")
-    refs = referral.get_direct_referrals(st.session_state.username)
-    st.write("Direct Referrals:", refs)
-
-    st.subheader("Transactions")
-    txns = db.get_transactions(st.session_state.username)
-    st.table(txns)
-
-# ------------------------------
-# Admin Dashboard
-# ------------------------------
-def admin_dashboard():
-    st.title("Admin Panel")
-
-    st.subheader("Pending Deposits")
-    deposits = payment.get_pending_deposits()
-    for dep in deposits:
-        st.write(dep)
-        col1, col2 = st.columns(2)
-        if col1.button("Approve", key=f"dep_ok_{dep['id']}"):
-            payment.approve_deposit(dep['id'])
-            st.rerun()
-        if col2.button("Reject", key=f"dep_no_{dep['id']}"):
-            payment.reject_deposit(dep['id'])
-            st.rerun()
-
-    st.subheader("Pending Withdrawals")
-    withdraws = payment.get_pending_withdrawals()
-    for wd in withdraws:
-        st.write(wd)
-        col1, col2 = st.columns(2)
-        if col1.button("Approve", key=f"wd_ok_{wd['id']}"):
-            payment.approve_withdraw(wd['id'])
-            st.rerun()
-        if col2.button("Reject", key=f"wd_no_{wd['id']}"):
-            payment.reject_withdraw(wd['id'])
-            st.rerun()
-
-    st.subheader("Analytics")
-    st.metric("Total Users", db.count_users())
-    st.metric("Total Deposits", db.total_deposits())
-    st.metric("Total Withdrawals", db.total_withdrawals())
-
-# ------------------------------
-# Main App
-# ------------------------------
-def main():
-    sidebar_auth()
-    if st.session_state.get("logged_in"):
-        if st.session_state.role == "admin":
-            admin_dashboard()
-        else:
-            user_dashboard()
+# show owner-only controls in sidebar
+if is_owner:
+    st.sidebar.success("Owner mode active")
+    admin_view = st.sidebar.selectbox("Owner views", ["Owner Dashboard","Config","Backup DB"])
+    if admin_view == "Config":
+        st.header("Configuration")
+        rates = config.get_commission_rates()
+        st.write("Current commission rates (level1, level2, ...):", rates)
+        new = st.text_input("Comma separated rates", value=",".join(str(r) for r in rates))
+        if st.button("Save rates"):
+            try:
+                parsed = [float(x.strip()) for x in new.split(",") if x.strip()]
+                config.set_commission_rates(parsed)
+                st.success("Saved")
+            except Exception as e:
+                st.error("Invalid format")
+    elif admin_view == "Backup DB":
+        st.header("Database Backup")
+        b = db.backup_db_bytes()
+        st.download_button("Download DB Backup", b, file_name="pyramid_app.db")
     else:
-        st.title("Welcome to Pyramid App")
-        st.write("Please login or register from the sidebar.")
+        st.header("Owner Dashboard")
+        ui.kpi_cards()
+        st.markdown("### Pending Transactions")
+        with get_db() as con:
+            pend = con.execute("SELECT t.*, u.username FROM transactions t LEFT JOIN users u ON u.id = t.member_id WHERE t.status='pending' ORDER BY created_at DESC").fetchall()
+        for tx in pend:
+            st.write(dict(tx))
+            col1, col2 = st.columns([1,1])
+            if col1.button(f"Approve {tx['id']}", key=f"app_{tx['id']}"):
+                try:
+                    payment.approve_transaction(tx["id"], approver=st.secrets.get("owner", {}).get("name", "owner"))
+                    st.success("Approved")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Approve failed: {e}")
+            if col2.button(f"Reject {tx['id']}", key=f"rej_{tx['id']}"):
+                payment.reject_transaction(tx["id"], reason="Rejected by owner")
+                st.warning("Rejected")
+                st.rerun()
 
-if __name__ == "__main__":
-    main()
+# Regular user view
+if st.session_state.get("user_id"):
+    uid = st.session_state["user_id"]
+    st.header("User Dashboard")
+    with get_db() as con:
+        user = con.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+    st.subheader(f"Welcome, {user['username']}")
+    st.metric("Balance (৳)", f"{user['balance']:,}")
+
+    # Deposit/Withdraw forms
+    st.markdown("#### Deposit Request (Manual)")
+    dep_col1, dep_col2 = st.columns(2)
+    with dep_col1:
+        dep_amt = st.number_input("Amount (৳)", min_value=10.0, step=10.0, key="dep_amt")
+        dep_method = st.selectbox("Method", ["nagad","bkash","rocket"], key="dep_method")
+        dep_note = st.text_input("Note / txn id (optional)", key="dep_note")
+        if st.button("Request Deposit", key="req_dep"):
+            txid = payment.create_transaction(uid, "deposit", float(dep_amt), method=dep_method, note=dep_note)
+            st.success(f"Deposit requested (tx id {txid}). Admin will approve.")
+
+    with dep_col2:
+        w_amt = st.number_input("Withdraw amount (৳)", min_value=50.0, step=50.0, key="w_amt")
+        w_method = st.selectbox("Withdraw method", ["nagad","bkash","rocket"], key="w_method")
+        w_note = st.text_input("Withdraw note / mobile", key="w_note")
+        if st.button("Request Withdraw", key="req_w"):
+            if user["balance"] is None or user["balance"] < float(w_amt):
+                st.error("Insufficient balance")
+            else:
+                payment.create_transaction(uid, "withdrawal", float(w_amt), method=w_method, note=w_note)
+                st.success("Withdrawal requested. Admin will process it.")
+
+    st.markdown("#### Your transactions")
+    df = ui.transactions_df(limit=500)
+    df_user = df[df["member_id"] == uid] if not df.empty else df
+    if not df_user.empty:
+        st.dataframe(df_user)
+        st.download_button("Download my transactions CSV", df_user.to_csv(index=False).encode(), file_name=f"{user['username']}_transactions.csv")
+    else:
+        st.info("No transactions yet.")
+
+    st.markdown("#### Your referrals")
+    refs = referral.get_direct_referrals(uid)
+    if refs:
+        for r in refs:
+            st.write(f"{r['username']} — joined {r['created_at']}")
+    else:
+        st.info("No referrals yet.")
+else:
+    st.info("Please login or register from the sidebar to use the app.")
+
+# Analytics section public/basic
+st.sidebar.markdown("---")
+if st.sidebar.checkbox("Show analytics"):
+    st.header("Analytics")
+    ui.kpi_cards()
+    ui.simple_deposit_withdraw_chart()
+    ui.export_transactions_csv()
