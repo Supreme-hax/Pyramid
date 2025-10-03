@@ -1,4 +1,6 @@
-# pyramid_app/auth.py
+# ============================================================================
+# auth.py - FIXED IMPORTS
+# ============================================================================
 """
 Authentication utilities:
 - register_user(username, password, email, referrer_username)
@@ -9,11 +11,10 @@ Authentication utilities:
 
 import os
 import hashlib
-import os
 import binascii
 from typing import Optional
 import streamlit as st
-from .db import get_db
+from db import get_db  # CHANGED: removed relative import
 
 # PBKDF2 params
 ITERATIONS = 200_000
