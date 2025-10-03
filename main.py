@@ -1,7 +1,7 @@
 # main.py  (Streamlit entrypoint)
 import streamlit as st
-from pyramid_app import auth, db, payment, referral, ui, config
-from pyramid_app.db import get_db
+import auth, db, payment, referral, ui, config
+from db import get_db
 import pandas as pd
 import io
 
